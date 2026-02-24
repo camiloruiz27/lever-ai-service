@@ -1,0 +1,9 @@
+# Environment files (sensitive)
+.env
+**/.env
+.env.*
+**/.env.*
+
+# Keep example env templates in version control
+!.env.example
+!**/.env.example
