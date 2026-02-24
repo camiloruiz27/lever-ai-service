@@ -1,0 +1,17 @@
+{
+  "name": "lever-ai-service",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Microservicio Express para generar propuestas legales con Google Gemini",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "@google/genai": "^1.28.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  }
+}
