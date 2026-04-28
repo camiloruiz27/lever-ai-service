@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, createPartFromBase64, createPartFromText } from '@google/genai';
 
 const app = express();
 const corsOrigin = process.env.CORS_ORIGIN || '*';
@@ -105,8 +105,130 @@ Ambos servicios serán prestados con total confidencialidad, diligencia y criter
 Nota: El valor expuesto se pretende libre de impuestos y retenciones, o puede generar IVA en caso de requerir factura electrónica
 `;
 
+const auditSystemInstruction = `
+Eres un revisor de calidad documental experto (LexiAudit). Tu funcion UNICA es senalar problemas de ortografia, redaccion, inconsistencias formales y omisiones de escritura.
+
+REGLAS CRITICAS:
+- NO corrijas el texto.
+- NO sugieras reescrituras.
+- NO hagas analisis legal o de fondo.
+- Se extremadamente preciso con la ubicacion (Pagina, Seccion, Parrafo) cuando el contenido lo permita.
+- Revisa ortografia, puntuacion, duplicidades, consistencia de terminos y formato de cifras o fechas.
+- Si el usuario pide algo fuera de este alcance, indica que estas limitado a auditoria formal.
+- Responde SIEMPRE en espanol.
+- Responde SOLO con JSON plano, sin markdown ni bloques de codigo.
+
+Formato obligatorio:
+{
+  "summary": "...",
+  "count": 0,
+  "findings": [
+    {
+      "type": "ortografia|consistencia|formato",
+      "location": "Pagina X, parrafo Y",
+      "text": "fragmento observado",
+      "reason": "motivo del hallazgo"
+    }
+  ]
+}
+`;
+
 app.get('/health', (_req, res) => {
   return res.status(200).json({ ok: true });
+});
+
+app.post('/api/audit', async (req, res) => {
+  try {
+    const authHeader = req.get('x-internal-api-key');
+    if (!authHeader || authHeader !== internalApiKey) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const {
+      document_name: documentName,
+      document_type: documentType,
+      audit_scope: auditScope,
+      operation_mode: operationMode,
+      mime_type: mimeType,
+      content,
+      pages,
+      file_base64: fileBase64,
+      source_mode: sourceMode,
+    } = req.body || {};
+
+    if ((!content || typeof content !== 'string') && (!fileBase64 || typeof fileBase64 !== 'string')) {
+      return res.status(400).json({ error: 'Falta el contenido del documento.' });
+    }
+
+    const normalizedPages = Array.isArray(pages)
+      ? pages
+          .filter((page) => page && typeof page.text === 'string' && page.text.trim() !== '')
+          .map((page) => `Pagina ${page.page ?? '?'}:\n${page.text}`)
+      : [];
+
+    const promptText = [
+      `Documento: ${documentName || 'Sin nombre'}`,
+      `Tipo: ${documentType || 'desconocido'}`,
+      `Alcance: ${auditScope || 'integral'}`,
+      `Modo: ${operationMode || 'estricto'}`,
+      `Origen: ${sourceMode || 'desconocido'}`,
+      '',
+      normalizedPages.length > 0
+        ? `Contenido paginado:\n${normalizedPages.join('\n\n')}`
+        : `Contenido:\n${content}`,
+    ].join('\n');
+
+    const parts = [createPartFromText(promptText)];
+    if (fileBase64 && typeof fileBase64 === 'string') {
+      parts.push(createPartFromBase64(fileBase64, mimeType || 'application/pdf'));
+    }
+
+    const stream = await ai.models.generateContentStream({
+      model,
+      contents: [
+        { role: 'user', parts },
+      ],
+      config: {
+        temperature: 0.1,
+        topP: 0.2,
+        maxOutputTokens: 4000,
+        thinkingConfig: { thinkingBudget: 0 },
+        systemInstruction: auditSystemInstruction,
+      },
+    });
+
+    let text = '';
+    for await (const chunk of stream) {
+      if (chunk?.text) text += chunk.text;
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(text.trim());
+    } catch (_error) {
+      return res.status(502).json({ error: 'Respuesta invalida del modelo.' });
+    }
+
+    const findings = Array.isArray(parsed?.findings) ? parsed.findings : [];
+    const normalizedFindings = findings
+      .filter((finding) => finding && typeof finding === 'object')
+      .map((finding) => ({
+        type: normalizeFindingType(finding.type),
+        location: String(finding.location || 'Sin ubicacion'),
+        text: String(finding.text || ''),
+        reason: String(finding.reason || ''),
+      }));
+
+    return res.json({
+      summary: String(parsed?.summary || 'Auditoria completada.'),
+      count: Number.isFinite(Number(parsed?.count)) ? Number(parsed.count) : normalizedFindings.length,
+      findings: normalizedFindings,
+    });
+  } catch (err) {
+    console.error(err);
+    const msg = err?.message || 'Error ejecutando auditoria documental';
+    return res.status(500).json({ error: msg });
+  }
 });
 
 app.post('/api/propuesta', async (req, res) => {
@@ -149,6 +271,18 @@ app.post('/api/propuesta', async (req, res) => {
     return res.status(500).json({ error: msg });
   }
 });
+
+function normalizeFindingType(type) {
+  const normalized = String(type || 'formato')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\s-]+/g, '_');
+
+  if (normalized.includes('ort')) return 'ortografia';
+  if (normalized.includes('consist')) return 'consistencia';
+  return 'formato';
+}
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
