@@ -28,6 +28,8 @@ if (!internalApiKey) {
 const ai = new GoogleGenAI({ apiKey });
 const model = 'gemini-3.1-flash-lite-preview';
 const MAX_MODEL_ERROR_LOG_CHARS = 1500;
+const MODEL_OVERLOAD_MAX_RETRIES = 2;
+const MODEL_OVERLOAD_BASE_DELAY_MS = 900;
 
 const systemInstruction = `
 Rol: Eres un asistente que redacta propuestas legales comerciales para un bufete de abogados.
@@ -314,20 +316,25 @@ app.post('/api/audit', async (req, res) => {
       parts.push(createPartFromBase64(fileBase64, mimeType || 'application/pdf'));
     }
 
-    const stream = await ai.models.generateContentStream({
+    const stream = await generateModelStreamWithRetry({
+      requestId,
+      endpoint: '/api/audit',
       model,
-      contents: [
-        { role: 'user', parts },
-      ],
-      config: {
-        temperature: 0.1,
-        topP: 0.2,
-        maxOutputTokens: 4000,
-        thinkingConfig: { thinkingBudget: 0 },
-        responseMimeType: 'application/json',
-        responseSchema: auditResponseSchema,
-        systemInstruction: auditSystemInstruction,
-      },
+      run: () => ai.models.generateContentStream({
+        model,
+        contents: [
+          { role: 'user', parts },
+        ],
+        config: {
+          temperature: 0.1,
+          topP: 0.2,
+          maxOutputTokens: 4000,
+          thinkingConfig: { thinkingBudget: 0 },
+          responseMimeType: 'application/json',
+          responseSchema: auditResponseSchema,
+          systemInstruction: auditSystemInstruction,
+        },
+      }),
     });
 
     let rawText = '';
@@ -376,14 +383,18 @@ app.post('/api/audit', async (req, res) => {
       token_usage: tokenUsage,
     });
   } catch (err) {
+    const runtimeError = normalizeModelRuntimeError(err, 'audit_runtime_error', 'Error ejecutando auditoria documental');
+
     logError('audit_unhandled_error', requestId, {
-      message: err?.message || 'Error ejecutando auditoria documental',
+      code: runtimeError.code,
+      status: runtimeError.status,
+      message: runtimeError.logMessage,
       stack: err?.stack,
     });
 
-    return res.status(500).json({
-      error: err?.message || 'Error ejecutando auditoria documental',
-      code: 'audit_runtime_error',
+    return res.status(runtimeError.status).json({
+      error: runtimeError.clientMessage,
+      code: runtimeError.code,
     });
   }
 });
@@ -406,18 +417,23 @@ app.post('/api/propuesta', async (req, res) => {
 
     const userInput = `${objetivo} | ${valorTotalCOP} | ${formaPago ?? ''} | ${razonSocial}`;
 
-    const stream = await ai.models.generateContentStream({
+    const stream = await generateModelStreamWithRetry({
+      requestId,
+      endpoint: '/api/propuesta',
       model,
-      contents: [
-        { role: 'user', parts: [{ text: userInput }] },
-      ],
-      config: {
-        temperature: 0.3,
-        topP: 0.3,
-        maxOutputTokens: 3000,
-        thinkingConfig: { thinkingBudget: 0 },
-        systemInstruction,
-      },
+      run: () => ai.models.generateContentStream({
+        model,
+        contents: [
+          { role: 'user', parts: [{ text: userInput }] },
+        ],
+        config: {
+          temperature: 0.3,
+          topP: 0.3,
+          maxOutputTokens: 3000,
+          thinkingConfig: { thinkingBudget: 0 },
+          systemInstruction,
+        },
+      }),
     });
 
     let text = '';
@@ -447,18 +463,116 @@ app.post('/api/propuesta', async (req, res) => {
 
     return res.json({ text, token_usage: tokenUsage });
   } catch (err) {
+    const runtimeError = normalizeModelRuntimeError(err, 'proposal_runtime_error', 'Error generando propuesta');
+
     logError('proposal_runtime_error', requestId, {
-      message: err?.message || 'Error generando propuesta',
+      code: runtimeError.code,
+      status: runtimeError.status,
+      message: runtimeError.logMessage,
       stack: err?.stack,
     });
 
-    return res.status(500).json({
-      error: err?.message || 'Error generando propuesta',
-      code: 'proposal_runtime_error',
+    return res.status(runtimeError.status).json({
+      error: runtimeError.clientMessage,
+      code: runtimeError.code,
     });
   }
 });
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function generateModelStreamWithRetry({ requestId, endpoint, model, run }) {
+  let attempt = 0;
+
+  while (true) {
+    try {
+      return await run();
+    } catch (err) {
+      if (!isModelOverloadedError(err) || attempt >= MODEL_OVERLOAD_MAX_RETRIES) {
+        throw err;
+      }
+
+      const retryInMs = computeRetryDelayMs(attempt);
+      logWarn('model_overloaded_retry', requestId, {
+        endpoint,
+        model,
+        attempt: attempt + 1,
+        retry_in_ms: retryInMs,
+        message: getModelErrorMessage(err),
+      });
+
+      await sleep(retryInMs);
+      attempt += 1;
+    }
+  }
+}
+
+function normalizeModelRuntimeError(err, fallbackCode, fallbackMessage) {
+  if (isModelOverloadedError(err)) {
+    return {
+      status: 503,
+      code: 'model_overloaded',
+      clientMessage: 'El servicio de IA esta presentando alta demanda. Intenta nuevamente en unos momentos.',
+      logMessage: getModelErrorMessage(err),
+    };
+  }
+
+  return {
+    status: 500,
+    code: fallbackCode,
+    clientMessage: err?.message || fallbackMessage,
+    logMessage: err?.message || fallbackMessage,
+  };
+}
+
+function isModelOverloadedError(err) {
+  const message = getModelErrorMessage(err).toLowerCase();
+  const status = extractModelErrorStatus(err);
+
+  return status === 503
+    || message.includes('high demand')
+    || message.includes('try again later')
+    || message.includes('service unavailable')
+    || message.includes('unavailable');
+}
+
+function extractModelErrorStatus(err) {
+  const directStatus = Number(err?.status || err?.code || err?.statusCode);
+  if (Number.isFinite(directStatus) && directStatus > 0) {
+    return directStatus;
+  }
+
+  const message = getModelErrorMessage(err);
+  const match = message.match(/"code"\s*:\s*(\d{3})/);
+  if (match) {
+    return Number(match[1]);
+  }
+
+  return 0;
+}
+
+function getModelErrorMessage(err) {
+  if (typeof err?.message === 'string' && err.message.trim() !== '') {
+    return err.message.trim();
+  }
+
+  if (typeof err === 'string' && err.trim() !== '') {
+    return err.trim();
+  }
+
+  try {
+    return JSON.stringify(err);
+  } catch (_error) {
+    return 'Error desconocido del modelo';
+  }
+}
+
+function computeRetryDelayMs(attempt) {
+  const jitter = Math.floor(Math.random() * 250);
+  return MODEL_OVERLOAD_BASE_DELAY_MS + (attempt * 700) + jitter;
+}
 app.use((err, req, res, next) => {
   if (err?.type === 'entity.too.large') {
     logWarn('payload_too_large', req.requestId, {
@@ -726,4 +840,3 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`AI service escuchando en http://localhost:${PORT}`);
 });
-
