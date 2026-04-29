@@ -114,7 +114,7 @@ Nota: El valor expuesto se pretende libre de impuestos y retenciones, o puede ge
 `;
 
 const auditSystemInstruction = `
-Eres un revisor de calidad documental experto (LexiAudit). Tu funcion UNICA es senalar problemas de ortografia, redaccion, inconsistencias formales y omisiones de escritura.
+Eres un revisor de calidad documental experto (LexiAudit). Tu funcion UNICA es senalar problemas de ortografia, redaccion, inconsistencias formales, omisiones de escritura y, cuando se active, contrastes documentales de nombre + cedula.
 
 REGLAS CRITICAS:
 - NO corrijas el texto.
@@ -122,6 +122,9 @@ REGLAS CRITICAS:
 - NO hagas analisis legal o de fondo.
 - Se extremadamente preciso con la ubicacion (Pagina, Seccion, Parrafo) cuando el contenido lo permita.
 - Revisa ortografia, puntuacion, duplicidades, consistencia de terminos y formato de cifras o fechas.
+- Si la validacion de identidades esta activa, identifica nombres y cedulas presentes en el documento y comparalos con las referencias manuales cuando existan.
+- Si detectas diferencias reales entre nombre y cedula esperados vs documento, registralas como hallazgos de tipo "consistencia" y tambien reflejalas dentro de identity_summary.
+- Si la validacion de identidades esta inactiva, identity_summary debe salir desactivado y vacio.
 - Si el usuario pide algo fuera de este alcance, indica que estas limitado a auditoria formal.
 - Responde SIEMPRE en espanol.
 - Responde SOLO con JSON plano, sin markdown ni bloques de codigo.
@@ -137,14 +140,35 @@ Formato obligatorio:
       "text": "fragmento observado",
       "reason": "motivo del hallazgo"
     }
-  ]
+  ],
+  "identity_summary": {
+    "enabled": false,
+    "references": [
+      {
+        "name": "Juan Perez",
+        "national_id": "123456789"
+      }
+    ],
+    "matches": [
+      {
+        "document_name": "Juan Perez",
+        "document_id": "123456789",
+        "status": "matched|mismatch|detected_only|reference_only",
+        "reference_name": "Juan Perez",
+        "reference_id": "123456789",
+        "reason": "motivo del estado"
+      }
+    ],
+    "detected_count": 0,
+    "mismatches_count": 0
+  }
 }
 `;
 
 const auditResponseSchema = {
   type: 'object',
   additionalProperties: false,
-  required: ['summary', 'count', 'findings'],
+  required: ['summary', 'count', 'findings', 'identity_summary'],
   properties: {
     summary: { type: 'string' },
     count: { type: 'integer', minimum: 0 },
@@ -165,6 +189,47 @@ const auditResponseSchema = {
         },
       },
     },
+    identity_summary: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['enabled', 'references', 'matches', 'detected_count', 'mismatches_count'],
+      properties: {
+        enabled: { type: 'boolean' },
+        references: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['name', 'national_id'],
+            properties: {
+              name: { type: 'string' },
+              national_id: { type: 'string' },
+            },
+          },
+        },
+        matches: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['document_name', 'document_id', 'status', 'reference_name', 'reference_id', 'reason'],
+            properties: {
+              document_name: { type: 'string' },
+              document_id: { type: 'string' },
+              status: {
+                type: 'string',
+                enum: ['matched', 'mismatch', 'detected_only', 'reference_only'],
+              },
+              reference_name: { type: 'string' },
+              reference_id: { type: 'string' },
+              reason: { type: 'string' },
+            },
+          },
+        },
+        detected_count: { type: 'integer', minimum: 0 },
+        mismatches_count: { type: 'integer', minimum: 0 },
+      },
+    },
   },
 };
 
@@ -183,7 +248,7 @@ app.post('/api/audit', async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized', code: 'unauthorized' });
     }
 
-    const {
+        const {
       document_name: documentName,
       document_type: documentType,
       audit_scope: auditScope,
@@ -193,7 +258,14 @@ app.post('/api/audit', async (req, res) => {
       pages,
       file_base64: fileBase64,
       source_mode: sourceMode,
+      identity_check_enabled: identityCheckEnabled,
+      detect_document_identities: detectDocumentIdentities,
+      identity_references: identityReferences,
     } = req.body || {};
+
+    const normalizedIdentityReferences = normalizeIdentityReferences(identityReferences);
+    const identityCheckActive = Boolean(identityCheckEnabled);
+    const detectDocumentIdentitiesActive = identityCheckActive && detectDocumentIdentities !== false;
 
     const auditContext = {
       request_id: requestId,
@@ -202,6 +274,8 @@ app.post('/api/audit', async (req, res) => {
       audit_scope: auditScope || 'integral',
       operation_mode: operationMode || 'estricto',
       source_mode: sourceMode || 'desconocido',
+      identity_check_enabled: identityCheckActive,
+      identity_reference_count: normalizedIdentityReferences.length,
     };
 
     if ((!content || typeof content !== 'string') && (!fileBase64 || typeof fileBase64 !== 'string')) {
@@ -218,12 +292,17 @@ app.post('/api/audit', async (req, res) => {
           .map((page) => `Pagina ${page.page ?? '?'}:\n${page.text}`)
       : [];
 
-    const promptText = [
+        const promptText = [
       `Documento: ${auditContext.document_name}`,
       `Tipo: ${auditContext.document_type}`,
       `Alcance: ${auditContext.audit_scope}`,
       `Modo: ${auditContext.operation_mode}`,
       `Origen: ${auditContext.source_mode}`,
+      `Validacion de identidades: ${identityCheckActive ? 'activa' : 'inactiva'}`,
+      `Deteccion automatica de identidades: ${detectDocumentIdentitiesActive ? 'activa' : 'inactiva'}`,
+      normalizedIdentityReferences.length > 0
+        ? `Referencias manuales esperadas:\n${normalizedIdentityReferences.map((reference, index) => `${index + 1}. ${reference.name} | Cedula: ${reference.national_id}`).join('\n')}`
+        : 'Referencias manuales esperadas: ninguna',
       '',
       normalizedPages.length > 0
         ? `Contenido paginado:\n${normalizedPages.join('\n\n')}`
@@ -466,7 +545,14 @@ function validateAuditResponseShape(payload) {
     };
   }
 
-  if (typeof payload.summary !== 'string' || !Number.isInteger(payload.count) || !Array.isArray(payload.findings)) {
+    if (
+    typeof payload.summary !== 'string'
+    || !Number.isInteger(payload.count)
+    || !Array.isArray(payload.findings)
+    || !payload.identity_summary
+    || typeof payload.identity_summary !== 'object'
+    || Array.isArray(payload.identity_summary)
+  ) {
     return {
       ok: false,
       code: 'invalid_model_schema',
@@ -505,14 +591,94 @@ function validateAuditResponseShape(payload) {
     });
   }
 
+    const normalizedIdentitySummary = normalizeIdentitySummary(payload.identity_summary);
+
   return {
     ok: true,
     data: {
       summary: normalizeTextField(payload.summary, 'Auditoria completada.'),
       count: payload.count,
       findings: normalizedFindings,
+      identity_summary: normalizedIdentitySummary,
     },
   };
+}
+
+function normalizeIdentityReferences(references) {
+  if (!Array.isArray(references)) {
+    return [];
+  }
+
+  return references.map((reference) => {
+    if (!reference || typeof reference !== 'object' || Array.isArray(reference)) {
+      return null;
+    }
+
+    const name = normalizeTextField(reference.name);
+    const nationalId = normalizeNationalId(reference.national_id);
+
+    if (!name && !nationalId) {
+      return null;
+    }
+
+    return {
+      name,
+      national_id: nationalId,
+    };
+  }).filter(Boolean);
+}
+
+function normalizeIdentitySummary(identitySummary) {
+  const payload = identitySummary && typeof identitySummary === 'object' && !Array.isArray(identitySummary)
+    ? identitySummary
+    : {};
+
+  const references = Array.isArray(payload.references) ? payload.references : [];
+  const matches = Array.isArray(payload.matches) ? payload.matches : [];
+
+  return {
+    enabled: Boolean(payload.enabled),
+    references: references.map((reference) => ({
+      name: normalizeTextField(reference?.name),
+      national_id: normalizeNationalId(reference?.national_id),
+    })).filter((reference) => reference.name || reference.national_id),
+    matches: matches.map((match) => ({
+      document_name: normalizeTextField(match?.document_name),
+      document_id: normalizeNationalId(match?.document_id),
+      status: normalizeIdentityMatchStatus(match?.status),
+      reference_name: normalizeTextField(match?.reference_name),
+      reference_id: normalizeNationalId(match?.reference_id),
+      reason: normalizeTextField(match?.reason),
+    })).filter((match) => (
+      match.document_name
+      || match.document_id
+      || match.reference_name
+      || match.reference_id
+      || match.reason
+    )),
+    detected_count: normalizeCount(payload.detected_count),
+    mismatches_count: normalizeCount(payload.mismatches_count),
+  };
+}
+
+function normalizeIdentityMatchStatus(status) {
+  const normalized = String(status || '')
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_');
+
+  if (normalized === 'matched' || normalized === 'mismatch' || normalized === 'reference_only') {
+    return normalized;
+  }
+
+  return 'detected_only';
+}
+
+function normalizeNationalId(value) {
+  return String(value || '').replace(/\D+/g, '');
+}
+
+function normalizeCount(value) {
+  return Number.isInteger(value) && value >= 0 ? value : 0;
 }
 
 function normalizeTextField(value, fallback = '') {
