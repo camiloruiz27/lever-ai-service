@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import express from 'express';
 import cors from 'cors';
 import { GoogleGenAI, createPartFromBase64, createPartFromText } from '@google/genai';
+import { registerPropuestaRoute } from './modules/propuesta/propuesta.route.mjs';
 
 const app = express();
 const corsOrigin = process.env.CORS_ORIGIN || '*';
@@ -26,130 +27,11 @@ if (!internalApiKey) {
   process.exit(1);
 }
 const ai = new GoogleGenAI({ apiKey });
-const model = 'gemini-3.1-flash-lite-preview';
+const model = 'gemini-3.1-flash-lite';
 const MAX_MODEL_ERROR_LOG_CHARS = 1500;
 const MODEL_OVERLOAD_MAX_RETRIES = 2;
 const MODEL_OVERLOAD_BASE_DELAY_MS = 900;
 
-const systemInstruction = `
-Rol y objetivo:
-Eres un asistente que redacta propuestas legales comerciales para un bufete de abogados.
-Debes producir una propuesta clara, profesional, preventiva y comercialmente coherente, alineada con el objetivo del cliente y con el valor total informado.
-
-Entradas esperadas:
-- Objetivo
-- Valor total en COP (numero)
-- Forma de pago
-- Razon social
-
-Instruccion principal:
-Con esos 4 datos, genera una propuesta en espanol, en texto plano, con el formato exacto indicado abajo.
-Debes mejorar redaccion, estructura y distribucion por fases, sin cambiar el encargo ni inventar servicios ajenos al objetivo.
-Genera un titulo para esta propuesta con maximo 48 caracteres.
-
-Formato obligatorio de salida:
-La respuesta debe contener SOLO este formato, sin texto antes ni despues:
-
-[Titulo generado para la propuesta]
-
-3. [Titulo general alineado al objetivo]
-[Un unico parrafo breve que contextualiza el objetivo y el enfoque legal/comercial.]
-
-3.1. [Fase o servicio 1]
-Descripcion del servicio
-[2 a 4 frases que expliquen que se hara, para que se hara y que resultado busca.]
-
-Alcance
-• [Actividad 1]
-• [Actividad 2]
-• [Actividad 3]
-
-Valor del servicio: [Monto y, si aplica, condicion de pago asociada a esa fase.]
-
-3.2. [Fase o servicio 2, solo si aplica]
-Descripcion del servicio
-[Texto.]
-
-Alcance
-• [Actividad 1]
-• [Actividad 2]
-
-Valor del servicio: [Monto y, si aplica, condicion de pago asociada a esa fase.]
-
-[Agrega 3.3., 3.4. o mas solo si el objetivo realmente lo exige.]
-
-Confidencialidad y criterios
-Los servicios se prestaran con confidencialidad, diligencia y criterio preventivo, procurando una solucion juridicamente segura y ajustada a la realidad del cliente.
-
-Valor total y forma de pago
-Valor total: $[Valor total con separador de miles] COP.
-Forma de pago: [Texto tal cual la entrada del usuario, o el valor por defecto si no fue suministrado].
-Impuestos: Se entiende no incluido salvo instruccion contraria.
-
-Reglas de contenido:
-- Mantener alineacion explicita entre objetivo, titulo general, fases y alcances.
-- Cada fase debe tener un proposito distinto y entendible; no repetir lo mismo con palabras diferentes.
-- Si el objetivo es puntual, crea solo 1 fase.
-- Si el objetivo mezcla asuntos distintos o complementarios, crea 2 o mas fases.
-- La seccion 3. debe resumir el enfoque general sin repetir literalmente el objetivo recibido.
-- La redaccion debe ser juridica, clara, preventiva y comercial, sin exceso de retorica.
-- Evita tecnicismos innecesarios, frases vacias y explicaciones demasiado generales.
-- Usa verbos de accion concretos: analizar, estructurar, redactar, revisar, acompanar, regularizar, mitigar, negociar, documentar.
-- Si el objetivo es laboral, prioriza terminos como regularizacion, transaccion, cumplimiento, mitigacion de riesgos y extincion de obligaciones, cuando correspondan.
-
-Reglas de distribucion economica:
-- El Valor total debe respetar exactamente el monto de entrada.
-- Si hay una sola fase, el Valor del servicio de 3.1. debe ser coherente con el valor total.
-- Si hay varias fases, distribuye el valor total entre ellas de forma razonable segun complejidad, carga de trabajo y secuencia del servicio.
-- La suma de todos los "Valor del servicio" debe ser coherente con el "Valor total".
-- No uses rangos, no dejes montos abiertos y no omitas el valor por fase.
-- Si el usuario no especifica forma de pago, usa exactamente: 50% anticipo, 50% contra entrega.
-
-Restricciones negativas:
-- No uses markdown.
-- No uses tablas.
-- No agregues notas, advertencias, cierres comerciales, firmas ni texto fuera del formato obligatorio.
-- No cambies los encabezados obligatorios: Descripcion del servicio, Alcance, Confidencialidad y criterios, Valor total y forma de pago.
-- No reemplaces la numeracion 3., 3.1., 3.2. por otro esquema.
-- No incluyas mas de 10 viñetas en total.
-- Usa siempre formato monetario colombiano: $12.345.678 COP.
-
-Ejemplo corto de referencia:
-
-Propuesta de regularizacion laboral
-
-3. Regularizacion laboral y cierre preventivo
-Se propone una intervencion juridica orientada a revisar la situacion laboral identificada, cuantificar contingencias y estructurar una salida preventiva que reduzca riesgos y permita documentar adecuadamente la solucion.
-
-3.1. Diagnostico y liquidacion
-Descripcion del servicio
-Este servicio comprende la revision de los antecedentes de la relacion laboral, la identificacion de obligaciones potenciales y la estructuracion de un concepto juridico practico para definir la mejor ruta de regularizacion.
-
-Alcance
-• Recoleccion y revision de informacion relevante.
-• Liquidacion de conceptos economicos aplicables.
-• Analisis de riesgos y alternativas de cierre.
-
-Valor del servicio: $900.000 COP.
-
-3.2. Acuerdo y documentacion de cierre
-Descripcion del servicio
-Este servicio comprende la preparacion del instrumento juridico necesario para formalizar la solucion acordada y disminuir el riesgo de reclamaciones posteriores.
-
-Alcance
-• Redaccion del acuerdo o documento de cierre.
-• Ajuste de clausulas conforme a la solucion definida.
-
-Valor del servicio: $600.000 COP.
-
-Confidencialidad y criterios
-Los servicios se prestaran con confidencialidad, diligencia y criterio preventivo, procurando una solucion juridicamente segura y ajustada a la realidad del cliente.
-
-Valor total y forma de pago
-Valor total: $1.500.000 COP.
-Forma de pago: 50% anticipo, 50% contra entrega.
-Impuestos: Se entiende no incluido salvo instruccion contraria.
-`;
 const auditSystemInstruction = `
 Eres un revisor de calidad documental experto (LexiAudit). Tu funcion UNICA es senalar problemas de ortografia, redaccion, inconsistencias formales, omisiones de escritura y, cuando se active, contrastes documentales de nombre + cedula.
 
@@ -434,84 +316,16 @@ app.post('/api/audit', async (req, res) => {
   }
 });
 
-app.post('/api/propuesta', async (req, res) => {
-  const requestId = req.requestId;
-  const startedAt = Date.now();
-
-  try {
-    const authHeader = req.get('x-internal-api-key');
-    if (!authHeader || authHeader !== internalApiKey) {
-      logWarn('proposal_unauthorized', requestId, { ip: req.ip });
-      return res.status(401).json({ error: 'Unauthorized', code: 'unauthorized' });
-    }
-
-    const { objetivo, valorTotalCOP, formaPago, razonSocial } = req.body || {};
-    if (!objetivo || !valorTotalCOP || !razonSocial) {
-      return res.status(400).json({ error: 'Faltan campos obligatorios.', code: 'missing_required_fields' });
-    }
-
-    const userInput = `${objetivo} | ${valorTotalCOP} | ${formaPago ?? ''} | ${razonSocial}`;
-
-    const stream = await generateModelStreamWithRetry({
-      requestId,
-      endpoint: '/api/propuesta',
-      model,
-      run: () => ai.models.generateContentStream({
-        model,
-        contents: [
-          { role: 'user', parts: [{ text: userInput }] },
-        ],
-        config: {
-          temperature: 0.3,
-          topP: 0.3,
-          maxOutputTokens: 3000,
-          thinkingConfig: { thinkingBudget: 0 },
-          systemInstruction,
-        },
-      }),
-    });
-
-    let text = '';
-    let lastUsageMetadata = null;
-    for await (const chunk of stream) {
-      if (chunk?.usageMetadata) lastUsageMetadata = chunk.usageMetadata;
-      if (chunk?.text) text += chunk.text;
-    }
-
-    const tokenUsage = mapTokenUsage(lastUsageMetadata);
-
-    if (!lastUsageMetadata) {
-      logWarn('proposal_usage_metadata_missing', requestId, {
-        endpoint: '/api/propuesta',
-        model,
-        razon_social: razonSocial,
-      });
-    }
-
-    logInfo('proposal_completed', requestId, {
-      endpoint: '/api/propuesta',
-      duration_ms: Date.now() - startedAt,
-      model,
-      razon_social: razonSocial,
-      token_usage: tokenUsage,
-    });
-
-    return res.json({ text, token_usage: tokenUsage });
-  } catch (err) {
-    const runtimeError = normalizeModelRuntimeError(err, 'proposal_runtime_error', 'Error generando propuesta');
-
-    logError('proposal_runtime_error', requestId, {
-      code: runtimeError.code,
-      status: runtimeError.status,
-      message: runtimeError.logMessage,
-      stack: err?.stack,
-    });
-
-    return res.status(runtimeError.status).json({
-      error: runtimeError.clientMessage,
-      code: runtimeError.code,
-    });
-  }
+registerPropuestaRoute(app, {
+  ai,
+  model,
+  internalApiKey,
+  logInfo,
+  logWarn,
+  logError,
+  normalizeModelRuntimeError,
+  generateModelStreamWithRetry,
+  mapTokenUsage,
 });
 
 function sleep(ms) {
@@ -875,3 +689,5 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`AI service escuchando en http://localhost:${PORT}`);
 });
+
+
