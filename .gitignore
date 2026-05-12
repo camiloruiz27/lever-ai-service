@@ -3,7 +3,10 @@
 **/.env
 .env.*
 **/.env.*
+/ai-service/.env
+/ai-service/.env.*
 
 # Keep example env templates in version control
 !.env.example
 !**/.env.example
+!/ai-service/.env.example
