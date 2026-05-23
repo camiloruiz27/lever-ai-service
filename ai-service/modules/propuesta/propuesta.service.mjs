@@ -1,12 +1,13 @@
-﻿import { PROPOSAL_SYSTEM_PROMPT_V2 } from './propuesta.prompt.mjs';
+import { PROPOSAL_SYSTEM_PROMPT_V2 } from './propuesta.prompt.mjs';
 import { buildProposalUserInput } from './propuesta.mapper.mjs';
 
 function hasInvestmentStructure(text) {
   const normalized = String(text || '');
-  const hasPhaseInvestment = /\bc\.\s*Inversion estimada\b/i.test(normalized);
-  const hasSummary = /Resumen de Inversion y Honorarios/i.test(normalized);
+  const hasPhaseValue = /\bc\.\s*Valor del servicio\b/i.test(normalized);
+  const hasPhasePayment = /\bd\.\s*Forma de pago\b/i.test(normalized);
+  const hasSummary = /Resumen de Valor y Honorarios/i.test(normalized);
   const hasMoney = /\$\s*\d[\d\.,]*\s*COP/i.test(normalized);
-  return hasPhaseInvestment && hasSummary && hasMoney;
+  return hasPhaseValue && hasPhasePayment && hasSummary && hasMoney;
 }
 
 export async function generateProposal({
@@ -71,8 +72,9 @@ export async function generateProposal({
     const correctionInput = [
       'Corrige y reescribe la propuesta anterior sin cambiar el caso de fondo.',
       'Debe incluir de forma obligatoria:',
-      '- c. Inversion estimada en cada fase.',
-      '- Resumen de Inversion y Honorarios.',
+      '- c. Valor del servicio en cada fase.',
+      '- d. Forma de pago en cada fase.',
+      '- Resumen de Valor y Honorarios.',
       '- Valores en formato colombiano y consistentes con el valor total.',
       '',
       'Respuesta previa a corregir:',
