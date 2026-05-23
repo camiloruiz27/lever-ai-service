@@ -1,4 +1,4 @@
-﻿function cleanText(value) {
+function cleanText(value) {
   return String(value ?? '').replace(/\s+/g, ' ').trim();
 }
 
@@ -8,6 +8,16 @@ function normalizeCopValue(value) {
   const digits = String(value).replace(/\D+/g, '');
   if (!digits) return null;
   return Number.isFinite(Number(digits)) ? Math.trunc(Number(digits)) : null;
+}
+
+function normalizeServiceCount(value) {
+  if (value === null || value === undefined || value === '') return 1;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 1;
+  const rounded = Math.trunc(parsed);
+  if (rounded < 1) return 1;
+  if (rounded > 10) return 10;
+  return rounded;
 }
 
 function formatCop(value) {
@@ -37,6 +47,7 @@ export function normalizeProposalContext(input) {
     comercial: {
       valorTotalCOP: normalizeCopValue(comercial.valorTotalCOP),
       formaPago: cleanText(comercial.formaPago) || 'No definido por el usuario.',
+      numeroServicios: normalizeServiceCount(comercial.numeroServicios),
     },
   };
 }
@@ -71,6 +82,7 @@ export function buildProposalUserInput(context) {
     `Contexto del caso: ${context.contextoCaso || 'No suministrado.'}`,
     `Partes involucradas: ${context.partesInvolucradas || 'No suministrado.'}`,
     `Servicios sugeridos: ${context.serviciosSugeridos || 'No suministrado.'}`,
+    `Numero de servicios objetivo: ${context.comercial.numeroServicios}`,
     `Etapa judicial: ${context.etapaJudicial}`,
     `Costos y exclusiones: ${context.costosExclusiones || 'No suministrado.'}`,
     `Tono principal: ${context.tonoPrincipal}`,
@@ -79,13 +91,15 @@ export function buildProposalUserInput(context) {
     `Informacion adicional: ${context.informacionAdicional || 'No suministrada.'}`,
     `Valor total COP: ${context.comercial.valorTotalCOP ?? 'No suministrado.'}`,
     `Valor total formateado: ${formatCop(context.comercial.valorTotalCOP)}`,
-    `Forma de pago: ${context.comercial.formaPago}`,
+    `Forma de pago (puede incluir valores distintos por servicio): ${context.comercial.formaPago}`,
     '',
+    `REGLA OBLIGATORIA: Debes estructurar exactamente ${context.comercial.numeroServicios} servicio(s) o fase(s).`,
+    'REGLA OBLIGATORIA: Cada fase debe incluir "c. Valor del servicio" y "d. Forma de pago".',
   ];
 
   if (valueExists) {
-    lines.push('REGLA OBLIGATORIA: Debes incluir "c. Inversion estimada" en cada fase.');
-    lines.push('REGLA OBLIGATORIA: Debes incluir la seccion "Resumen de Inversion y Honorarios".');
+    lines.push('REGLA OBLIGATORIA: Debes incluir "c. Valor del servicio" en cada fase.');
+    lines.push('REGLA OBLIGATORIA: Debes incluir la seccion "Resumen de Valor y Honorarios".');
     lines.push(`REGLA OBLIGATORIA: La suma de fases debe ser exactamente ${formatCop(context.comercial.valorTotalCOP)}.`);
   }
 
