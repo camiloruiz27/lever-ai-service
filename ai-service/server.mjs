@@ -152,6 +152,72 @@ const auditResponseSchema = {
   },
 };
 
+const contractAnalysisSystemInstruction = `
+Eres un abogado senior experto en auditoria de contratos y analisis de riesgos. Tu trabajo es analizar el contrato desde la perspectiva de la parte defendida.
+
+REGLAS CRITICAS:
+- SIEMPRE responde en espanol.
+- SOLO responde con JSON plano, sin markdown envolvente ni bloques de codigo.
+- NO inventes clausulas inexistentes.
+- Prioriza riesgos reales, asimetrias, ambiguedades, omisiones, obligaciones desbalanceadas, sanciones, responsabilidad, pagos, terminacion, ley aplicable y resolucion de disputas cuando existan.
+- Si el contrato no trae suficiente contexto, dilo expresamente en el dictamen sin fabricar hechos.
+- report_markdown debe venir en markdown limpio y legible.
+
+Formato obligatorio:
+{
+  "summary": "resumen ejecutivo breve",
+  "risk_level": "alto|medio|bajo",
+  "findings": [
+    {
+      "title": "hallazgo",
+      "severity": "alto|medio|bajo",
+      "clause": "clausula o referencia",
+      "risk": "riesgo detectado",
+      "impact": "impacto para la parte defendida",
+      "recommendation": "accion o ajuste recomendado"
+    }
+  ],
+  "recommendations": ["recomendacion 1"],
+  "report_markdown": "dictamen completo en markdown"
+}
+`;
+
+const contractAnalysisResponseSchema = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['summary', 'risk_level', 'findings', 'recommendations', 'report_markdown'],
+  properties: {
+    summary: { type: 'string' },
+    risk_level: {
+      type: 'string',
+      enum: ['alto', 'medio', 'bajo'],
+    },
+    findings: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['title', 'severity', 'clause', 'risk', 'impact', 'recommendation'],
+        properties: {
+          title: { type: 'string' },
+          severity: {
+            type: 'string',
+            enum: ['alto', 'medio', 'bajo'],
+          },
+          clause: { type: 'string' },
+          risk: { type: 'string' },
+          impact: { type: 'string' },
+          recommendation: { type: 'string' },
+        },
+      },
+    },
+    recommendations: {
+      type: 'array',
+      items: { type: 'string' },
+    },
+    report_markdown: { type: 'string' },
+  },
+};
 app.get('/health', (_req, res) => {
   return res.status(200).json({ ok: true });
 });
@@ -316,6 +382,137 @@ app.post('/api/audit', async (req, res) => {
   }
 });
 
+app.post('/api/analyze-contract', async (req, res) => {
+  const requestId = req.requestId;
+  const startedAt = Date.now();
+
+  try {
+    const authHeader = req.get('x-internal-api-key');
+    if (!authHeader || authHeader !== internalApiKey) {
+      logWarn('contract_analysis_unauthorized', requestId, { ip: req.ip });
+      return res.status(401).json({ error: 'Unauthorized', code: 'unauthorized' });
+    }
+
+    const {
+      party,
+      party_name: partyName,
+      contract_type: contractType,
+      jurisdiction,
+      aggressiveness,
+      contract_text: contractText,
+      counterparty,
+      metadata,
+    } = req.body || {};
+
+    const normalizedPayload = {
+      party: normalizeTextField(party),
+      party_name: normalizeTextField(partyName),
+      contract_type: normalizeTextField(contractType),
+      jurisdiction: normalizeTextField(jurisdiction),
+      aggressiveness: normalizeContractSeverity(aggressiveness, 'equilibrado'),
+      contract_text: String(contractText || '').trim(),
+      counterparty: normalizeTextField(counterparty),
+      source: normalizeTextField(metadata?.source, 'lever_admin_contract_audit'),
+    };
+
+    if (!normalizedPayload.party || !normalizedPayload.party_name || !normalizedPayload.contract_type || !normalizedPayload.jurisdiction || !normalizedPayload.contract_text) {
+      logWarn('contract_analysis_missing_fields', requestId, {
+        endpoint: '/api/analyze-contract',
+        source: normalizedPayload.source,
+      });
+      return res.status(400).json({
+        error: 'Faltan campos requeridos para el analisis contractual.',
+        code: 'missing_required_fields',
+      });
+    }
+
+    const promptText = [
+      `Parte defendida: ${normalizedPayload.party_name}`,
+      `Rol defendido: ${normalizedPayload.party}`,
+      `Tipo de contrato: ${normalizedPayload.contract_type}`,
+      `Jurisdiccion aplicable: ${normalizedPayload.jurisdiction}`,
+      `Rigor de proteccion solicitado: ${normalizedPayload.aggressiveness}`,
+      normalizedPayload.counterparty ? `Contraparte: ${normalizedPayload.counterparty}` : 'Contraparte: no informada',
+      `Fuente: ${normalizedPayload.source}`,
+      '',
+      'Texto contractual a evaluar:',
+      normalizedPayload.contract_text,
+    ].join('\n');
+
+    const stream = await generateModelStreamWithRetry({
+      requestId,
+      endpoint: '/api/analyze-contract',
+      model,
+      run: () => ai.models.generateContentStream({
+        model,
+        contents: [
+          { role: 'user', parts: [createPartFromText(promptText)] },
+        ],
+        config: {
+          temperature: 0.15,
+          topP: 0.3,
+          maxOutputTokens: 5000,
+          thinkingConfig: { thinkingBudget: 0 },
+          responseMimeType: 'application/json',
+          responseSchema: contractAnalysisResponseSchema,
+          systemInstruction: contractAnalysisSystemInstruction,
+        },
+      }),
+    });
+
+    let rawText = '';
+    let lastUsageMetadata = null;
+    for await (const chunk of stream) {
+      if (chunk?.usageMetadata) lastUsageMetadata = chunk.usageMetadata;
+      if (chunk?.text) rawText += chunk.text;
+    }
+
+    const tokenUsage = mapTokenUsage(lastUsageMetadata);
+    const parsedResult = parseContractAnalysisResponse(rawText);
+    if (!parsedResult.ok) {
+      logError('contract_analysis_invalid_payload', requestId, {
+        endpoint: '/api/analyze-contract',
+        duration_ms: Date.now() - startedAt,
+        failure_code: parsedResult.code,
+        failure_message: parsedResult.message,
+        model_output_preview: truncateForLog(rawText),
+      });
+
+      return res.status(502).json({
+        error: parsedResult.message,
+        code: parsedResult.code,
+      });
+    }
+
+    logInfo('contract_analysis_completed', requestId, {
+      endpoint: '/api/analyze-contract',
+      duration_ms: Date.now() - startedAt,
+      model,
+      risk_level: parsedResult.data.risk_level,
+      findings_count: parsedResult.data.findings.length,
+      token_usage: tokenUsage,
+    });
+
+    return res.json({
+      ...parsedResult.data,
+      token_usage: tokenUsage,
+    });
+  } catch (err) {
+    const runtimeError = normalizeModelRuntimeError(err, 'contract_analysis_runtime_error', 'Error ejecutando analisis contractual');
+
+    logError('contract_analysis_unhandled_error', requestId, {
+      code: runtimeError.code,
+      status: runtimeError.status,
+      message: runtimeError.logMessage,
+      stack: err?.stack,
+    });
+
+    return res.status(runtimeError.status).json({
+      error: runtimeError.clientMessage,
+      code: runtimeError.code,
+    });
+  }
+});
 registerPropuestaRoute(app, {
   ai,
   model,
@@ -567,6 +764,102 @@ function validateAuditResponseShape(payload) {
   };
 }
 
+function parseContractAnalysisResponse(rawText) {
+  const trimmed = String(rawText || '').trim();
+  if (!trimmed) {
+    return {
+      ok: false,
+      code: 'invalid_model_json',
+      message: 'El modelo devolvio una respuesta vacia para el analisis contractual.',
+    };
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (_error) {
+    return {
+      ok: false,
+      code: 'invalid_model_json',
+      message: 'El modelo devolvio una respuesta invalida para el analisis contractual.',
+    };
+  }
+
+  return validateContractAnalysisResponseShape(parsed);
+}
+
+function validateContractAnalysisResponseShape(payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return {
+      ok: false,
+      code: 'invalid_model_schema',
+      message: 'El modelo devolvio una estructura invalida para el analisis contractual.',
+    };
+  }
+
+  if (
+    typeof payload.summary !== 'string'
+    || typeof payload.risk_level !== 'string'
+    || !Array.isArray(payload.findings)
+    || !Array.isArray(payload.recommendations)
+    || typeof payload.report_markdown !== 'string'
+  ) {
+    return {
+      ok: false,
+      code: 'invalid_model_schema',
+      message: 'El modelo devolvio una estructura invalida para el analisis contractual.',
+    };
+  }
+
+  const normalizedFindings = [];
+  for (const finding of payload.findings) {
+    if (!finding || typeof finding !== 'object' || Array.isArray(finding)) {
+      return {
+        ok: false,
+        code: 'invalid_model_schema',
+        message: 'El modelo devolvio una estructura invalida para el analisis contractual.',
+      };
+    }
+
+    normalizedFindings.push({
+      title: normalizeTextField(finding.title, 'Hallazgo contractual'),
+      severity: normalizeContractSeverity(finding.severity, 'medio'),
+      clause: normalizeTextField(finding.clause, 'Sin referencia especifica'),
+      risk: normalizeTextField(finding.risk),
+      impact: normalizeTextField(finding.impact),
+      recommendation: normalizeTextField(finding.recommendation),
+    });
+  }
+
+  return {
+    ok: true,
+    data: {
+      summary: normalizeTextField(payload.summary, 'Analisis contractual completado.'),
+      risk_level: normalizeContractSeverity(payload.risk_level, 'medio'),
+      findings: normalizedFindings,
+      recommendations: payload.recommendations.map((item) => normalizeTextField(item)).filter(Boolean),
+      report_markdown: normalizeTextField(payload.report_markdown, 'Sin dictamen disponible.'),
+    },
+  };
+}
+
+function normalizeContractSeverity(value, fallback = 'medio') {
+  const normalized = String(value || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\s-]+/g, '_');
+
+  if (normalized === 'alto' || normalized === 'medio' || normalized === 'bajo') {
+    return normalized;
+  }
+
+  if (normalized === 'muy_protector' || normalized === 'protector' || normalized === 'equilibrado') {
+    return normalized;
+  }
+
+  return fallback;
+}
 function normalizeIdentityReferences(references) {
   if (!Array.isArray(references)) {
     return [];
@@ -689,5 +982,7 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`AI service escuchando en http://localhost:${PORT}`);
 });
+
+
 
 
