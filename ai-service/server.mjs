@@ -1,4 +1,4 @@
-﻿import 'dotenv/config';
+import 'dotenv/config';
 import crypto from 'crypto';
 import express from 'express';
 import cors from 'cors';
@@ -33,7 +33,7 @@ const MODEL_OVERLOAD_MAX_RETRIES = 2;
 const MODEL_OVERLOAD_BASE_DELAY_MS = 900;
 
 const auditSystemInstruction = `
-Eres un revisor de calidad documental experto (LexiAudit). Tu funcion UNICA es senalar problemas de ortografia, redaccion, inconsistencias formales, omisiones de escritura y, cuando se active, contrastes documentales de nombre + cedula.
+Eres un revisor de calidad documental experto (LexiAudit). Tu funcion UNICA es senalar problemas de ortografia, redaccion, inconsistencias formales, omisiones de escritura y, cuando se active, contrastes documentales usando referencias tipadas.
 
 REGLAS CRITICAS:
 - NO corrijas el texto.
@@ -41,9 +41,10 @@ REGLAS CRITICAS:
 - NO hagas analisis legal o de fondo.
 - Se extremadamente preciso con la ubicacion (Pagina, Seccion, Parrafo) cuando el contenido lo permita.
 - Revisa ortografia, puntuacion, duplicidades, consistencia de terminos y formato de cifras o fechas.
-- Si la validacion de identidades esta activa, identifica nombres y cedulas presentes en el documento y comparalos con las referencias manuales cuando existan.
-- Si detectas diferencias reales entre nombre y cedula esperados vs documento, registralas como hallazgos de tipo "consistencia" y tambien reflejalas dentro de identity_summary.
-- Si la validacion de identidades esta inactiva, identity_summary debe salir desactivado y vacio.
+- Si la validacion de referencias esta activa, identifica en el documento coincidencias o diferencias frente a las referencias manuales esperadas segun su tipo.
+- Los tipos posibles de referencia son: cedula, nit, nombre, razon_social, correo, fecha y valor.
+- Si detectas diferencias reales entre una referencia esperada y el documento, registralas como hallazgos de tipo "consistencia" y tambien reflejalas dentro de reference_summary.
+- Si la validacion de referencias esta inactiva, reference_summary debe salir desactivado y vacio.
 - Si el usuario pide algo fuera de este alcance, indica que estas limitado a auditoria formal.
 - Responde SIEMPRE en espanol.
 - Responde SOLO con JSON plano, sin markdown ni bloques de codigo.
@@ -60,21 +61,20 @@ Formato obligatorio:
       "reason": "motivo del hallazgo"
     }
   ],
-  "identity_summary": {
+  "reference_summary": {
     "enabled": false,
     "references": [
       {
-        "name": "Juan Perez",
-        "national_id": "123456789"
+        "type": "cedula",
+        "value": "123456789"
       }
     ],
     "matches": [
       {
-        "document_name": "Juan Perez",
-        "document_id": "123456789",
+        "type": "cedula",
+        "document_value": "123456789",
         "status": "matched|mismatch|detected_only|reference_only",
-        "reference_name": "Juan Perez",
-        "reference_id": "123456789",
+        "reference_value": "123456789",
         "reason": "motivo del estado"
       }
     ],
@@ -87,7 +87,7 @@ Formato obligatorio:
 const auditResponseSchema = {
   type: 'object',
   additionalProperties: false,
-  required: ['summary', 'count', 'findings', 'identity_summary'],
+  required: ['summary', 'count', 'findings', 'reference_summary'],
   properties: {
     summary: { type: 'string' },
     count: { type: 'integer', minimum: 0 },
@@ -108,7 +108,7 @@ const auditResponseSchema = {
         },
       },
     },
-    identity_summary: {
+    reference_summary: {
       type: 'object',
       additionalProperties: false,
       required: ['enabled', 'references', 'matches', 'detected_count', 'mismatches_count'],
@@ -119,10 +119,10 @@ const auditResponseSchema = {
           items: {
             type: 'object',
             additionalProperties: false,
-            required: ['name', 'national_id'],
+            required: ['type', 'value'],
             properties: {
-              name: { type: 'string' },
-              national_id: { type: 'string' },
+              type: { type: 'string' },
+              value: { type: 'string' },
             },
           },
         },
@@ -131,16 +131,15 @@ const auditResponseSchema = {
           items: {
             type: 'object',
             additionalProperties: false,
-            required: ['document_name', 'document_id', 'status', 'reference_name', 'reference_id', 'reason'],
+            required: ['type', 'document_value', 'status', 'reference_value', 'reason'],
             properties: {
-              document_name: { type: 'string' },
-              document_id: { type: 'string' },
+              type: { type: 'string' },
+              document_value: { type: 'string' },
               status: {
                 type: 'string',
                 enum: ['matched', 'mismatch', 'detected_only', 'reference_only'],
               },
-              reference_name: { type: 'string' },
-              reference_id: { type: 'string' },
+              reference_value: { type: 'string' },
               reason: { type: 'string' },
             },
           },
@@ -243,14 +242,14 @@ app.post('/api/audit', async (req, res) => {
       pages,
       file_base64: fileBase64,
       source_mode: sourceMode,
-      identity_check_enabled: identityCheckEnabled,
-      detect_document_identities: detectDocumentIdentities,
-      identity_references: identityReferences,
+      reference_check_enabled: referenceCheckEnabled,
+      detect_document_references: detectDocumentReferences,
+      audit_references: auditReferences,
     } = req.body || {};
 
-    const normalizedIdentityReferences = normalizeIdentityReferences(identityReferences);
-    const identityCheckActive = Boolean(identityCheckEnabled);
-    const detectDocumentIdentitiesActive = identityCheckActive && detectDocumentIdentities !== false;
+    const normalizedAuditReferences = normalizeAuditReferences(auditReferences);
+    const referenceCheckActive = Boolean(referenceCheckEnabled);
+    const detectDocumentReferencesActive = referenceCheckActive && detectDocumentReferences !== false;
 
     const auditContext = {
       request_id: requestId,
@@ -259,8 +258,8 @@ app.post('/api/audit', async (req, res) => {
       audit_scope: auditScope || 'integral',
       operation_mode: operationMode || 'estricto',
       source_mode: sourceMode || 'desconocido',
-      identity_check_enabled: identityCheckActive,
-      identity_reference_count: normalizedIdentityReferences.length,
+      reference_check_enabled: referenceCheckActive,
+      reference_count: normalizedAuditReferences.length,
     };
 
     if ((!content || typeof content !== 'string') && (!fileBase64 || typeof fileBase64 !== 'string')) {
@@ -283,10 +282,10 @@ app.post('/api/audit', async (req, res) => {
       `Alcance: ${auditContext.audit_scope}`,
       `Modo: ${auditContext.operation_mode}`,
       `Origen: ${auditContext.source_mode}`,
-      `Validacion de identidades: ${identityCheckActive ? 'activa' : 'inactiva'}`,
-      `Deteccion automatica de identidades: ${detectDocumentIdentitiesActive ? 'activa' : 'inactiva'}`,
-      normalizedIdentityReferences.length > 0
-        ? `Referencias manuales esperadas:\n${normalizedIdentityReferences.map((reference, index) => `${index + 1}. ${reference.name} | Cedula: ${reference.national_id}`).join('\n')}`
+      `Validacion de referencias: ${referenceCheckActive ? 'activa' : 'inactiva'}`,
+      `Deteccion automatica de referencias: ${detectDocumentReferencesActive ? 'activa' : 'inactiva'}`,
+      normalizedAuditReferences.length > 0
+        ? `Referencias manuales esperadas:\n${normalizedAuditReferences.map((reference, index) => `${index + 1}. Tipo: ${reference.type} | Valor: ${reference.value}`).join('\n')}`
         : 'Referencias manuales esperadas: ninguna',
       '',
       normalizedPages.length > 0
@@ -709,9 +708,9 @@ function validateAuditResponseShape(payload) {
     typeof payload.summary !== 'string'
     || !Number.isInteger(payload.count)
     || !Array.isArray(payload.findings)
-    || !payload.identity_summary
-    || typeof payload.identity_summary !== 'object'
-    || Array.isArray(payload.identity_summary)
+    || !payload.reference_summary
+    || typeof payload.reference_summary !== 'object'
+    || Array.isArray(payload.reference_summary)
   ) {
     return {
       ok: false,
@@ -751,7 +750,7 @@ function validateAuditResponseShape(payload) {
     });
   }
 
-    const normalizedIdentitySummary = normalizeIdentitySummary(payload.identity_summary);
+  const normalizedReferenceSummary = normalizeReferenceSummary(payload.reference_summary);
 
   return {
     ok: true,
@@ -759,7 +758,7 @@ function validateAuditResponseShape(payload) {
       summary: normalizeTextField(payload.summary, 'Auditoria completada.'),
       count: payload.count,
       findings: normalizedFindings,
-      identity_summary: normalizedIdentitySummary,
+      reference_summary: normalizedReferenceSummary,
     },
   };
 }
@@ -860,7 +859,7 @@ function normalizeContractSeverity(value, fallback = 'medio') {
 
   return fallback;
 }
-function normalizeIdentityReferences(references) {
+function normalizeAuditReferences(references) {
   if (!Array.isArray(references)) {
     return [];
   }
@@ -870,23 +869,23 @@ function normalizeIdentityReferences(references) {
       return null;
     }
 
-    const name = normalizeTextField(reference.name);
-    const nationalId = normalizeNationalId(reference.national_id);
+    const type = normalizeReferenceType(reference.type);
+    const value = normalizeReferenceValue(type, reference.value);
 
-    if (!name && !nationalId) {
+    if (!type && !value) {
       return null;
     }
 
     return {
-      name,
-      national_id: nationalId,
+      type,
+      value,
     };
-  }).filter(Boolean);
+  }).filter((reference) => reference && (reference.type || reference.value));
 }
 
-function normalizeIdentitySummary(identitySummary) {
-  const payload = identitySummary && typeof identitySummary === 'object' && !Array.isArray(identitySummary)
-    ? identitySummary
+function normalizeReferenceSummary(referenceSummary) {
+  const payload = referenceSummary && typeof referenceSummary === 'object' && !Array.isArray(referenceSummary)
+    ? referenceSummary
     : {};
 
   const references = Array.isArray(payload.references) ? payload.references : [];
@@ -894,22 +893,24 @@ function normalizeIdentitySummary(identitySummary) {
 
   return {
     enabled: Boolean(payload.enabled),
-    references: references.map((reference) => ({
-      name: normalizeTextField(reference?.name),
-      national_id: normalizeNationalId(reference?.national_id),
-    })).filter((reference) => reference.name || reference.national_id),
-    matches: matches.map((match) => ({
-      document_name: normalizeTextField(match?.document_name),
-      document_id: normalizeNationalId(match?.document_id),
-      status: normalizeIdentityMatchStatus(match?.status),
-      reference_name: normalizeTextField(match?.reference_name),
-      reference_id: normalizeNationalId(match?.reference_id),
-      reason: normalizeTextField(match?.reason),
-    })).filter((match) => (
-      match.document_name
-      || match.document_id
-      || match.reference_name
-      || match.reference_id
+    references: references.map((reference) => {
+      const type = normalizeReferenceType(reference?.type);
+      const value = normalizeReferenceValue(type, reference?.value);
+      return { type, value };
+    }).filter((reference) => reference.type || reference.value),
+    matches: matches.map((match) => {
+      const type = normalizeReferenceType(match?.type);
+      return {
+        type,
+        document_value: normalizeReferenceValue(type, match?.document_value),
+        status: normalizeReferenceMatchStatus(match?.status),
+        reference_value: normalizeReferenceValue(type, match?.reference_value),
+        reason: normalizeTextField(match?.reason),
+      };
+    }).filter((match) => (
+      match.type
+      || match.document_value
+      || match.reference_value
       || match.reason
     )),
     detected_count: normalizeCount(payload.detected_count),
@@ -917,7 +918,7 @@ function normalizeIdentitySummary(identitySummary) {
   };
 }
 
-function normalizeIdentityMatchStatus(status) {
+function normalizeReferenceMatchStatus(status) {
   const normalized = String(status || '')
     .toLowerCase()
     .replace(/[\s-]+/g, '_');
@@ -929,10 +930,34 @@ function normalizeIdentityMatchStatus(status) {
   return 'detected_only';
 }
 
-function normalizeNationalId(value) {
-  return String(value || '').replace(/\D+/g, '');
+function normalizeReferenceType(type) {
+  const normalized = String(type || '')
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_');
+
+  if (['cedula', 'nit', 'nombre', 'razon_social', 'correo', 'fecha', 'valor'].includes(normalized)) {
+    return normalized;
+  }
+
+  return '';
 }
 
+function normalizeReferenceValue(type, value) {
+  const normalized = normalizeTextField(value);
+  if (!normalized) {
+    return '';
+  }
+
+  if (type === 'cedula' || type === 'nit' || type === 'valor') {
+    return String(normalized).replace(/\D+/g, '');
+  }
+
+  if (type === 'correo') {
+    return String(normalized).toLowerCase();
+  }
+
+  return normalized;
+}
 function normalizeCount(value) {
   return Number.isInteger(value) && value >= 0 ? value : 0;
 }
@@ -982,6 +1007,10 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`AI service escuchando en http://localhost:${PORT}`);
 });
+
+
+
+
 
 
 
