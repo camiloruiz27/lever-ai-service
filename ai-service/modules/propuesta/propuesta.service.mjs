@@ -33,9 +33,9 @@ export async function generateProposal({
         ],
         config: {
           temperature: 0.2,
-          topP: 0.3,
+          topP: 0.4,
           maxOutputTokens: 3500,
-          thinkingConfig: { thinkingBudget: 0 },
+          thinkingConfig: { thinkingLevel: 'minimal' },
           systemInstruction: PROPOSAL_SYSTEM_PROMPT_V2,
         },
       }),

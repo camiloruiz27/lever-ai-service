@@ -27,7 +27,7 @@ if (!internalApiKey) {
   process.exit(1);
 }
 const ai = new GoogleGenAI({ apiKey });
-const model = 'gemini-3.1-flash-lite';
+const model = 'gemini-3.5-flash-lite';
 const MAX_MODEL_ERROR_LOG_CHARS = 1500;
 const MODEL_OVERLOAD_MAX_RETRIES = 2;
 const MODEL_OVERLOAD_BASE_DELAY_MS = 900;
@@ -159,6 +159,9 @@ REGLAS CRITICAS:
 - SOLO responde con JSON plano, sin markdown envolvente ni bloques de codigo.
 - NO inventes clausulas inexistentes.
 - Prioriza riesgos reales, asimetrias, ambiguedades, omisiones, obligaciones desbalanceadas, sanciones, responsabilidad, pagos, terminacion, ley aplicable y resolucion de disputas cuando existan.
+- Ademas del diagnostico, entrega sugerencias accionables de mejora contractual clasificadas como "agregar", "quitar" o "rectificar".
+- Cada sugerencia debe explicar el motivo y, cuando haya contexto suficiente, incluir un texto propuesto listo para copiar en proposed_text.
+- Deja proposed_text vacio solo si no hay informacion suficiente para redactar con seguridad.
 - Si el contrato no trae suficiente contexto, dilo expresamente en el dictamen sin fabricar hechos.
 - report_markdown debe venir en markdown limpio y legible.
 
@@ -176,6 +179,16 @@ Formato obligatorio:
       "recommendation": "accion o ajuste recomendado"
     }
   ],
+  "suggestions": [
+    {
+      "action": "agregar|quitar|rectificar",
+      "title": "sugerencia accionable",
+      "clause": "clausula o referencia",
+      "reason": "por que conviene hacer este ajuste",
+      "proposed_text": "texto sugerido listo para copiar cuando aplique",
+      "priority": "alta|media|baja"
+    }
+  ],
   "recommendations": ["recomendacion 1"],
   "report_markdown": "dictamen completo en markdown"
 }
@@ -184,7 +197,7 @@ Formato obligatorio:
 const contractAnalysisResponseSchema = {
   type: 'object',
   additionalProperties: false,
-  required: ['summary', 'risk_level', 'findings', 'recommendations', 'report_markdown'],
+  required: ['summary', 'risk_level', 'findings', 'suggestions', 'recommendations', 'report_markdown'],
   properties: {
     summary: { type: 'string' },
     risk_level: {
@@ -207,6 +220,28 @@ const contractAnalysisResponseSchema = {
           risk: { type: 'string' },
           impact: { type: 'string' },
           recommendation: { type: 'string' },
+        },
+      },
+    },
+    suggestions: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['action', 'title', 'clause', 'reason', 'proposed_text', 'priority'],
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['agregar', 'quitar', 'rectificar'],
+          },
+          title: { type: 'string' },
+          clause: { type: 'string' },
+          reason: { type: 'string' },
+          proposed_text: { type: 'string' },
+          priority: {
+            type: 'string',
+            enum: ['alta', 'media', 'baja'],
+          },
         },
       },
     },
@@ -311,7 +346,7 @@ app.post('/api/audit', async (req, res) => {
           temperature: 0.1,
           topP: 0.2,
           maxOutputTokens: 4000,
-          thinkingConfig: { thinkingBudget: 0 },
+          thinkingConfig: { thinkingLevel: 'minimal' },
           responseMimeType: 'application/json',
           responseSchema: auditResponseSchema,
           systemInstruction: auditSystemInstruction,
@@ -451,7 +486,7 @@ app.post('/api/analyze-contract', async (req, res) => {
           temperature: 0.15,
           topP: 0.3,
           maxOutputTokens: 5000,
-          thinkingConfig: { thinkingBudget: 0 },
+          thinkingConfig: { thinkingLevel: 'minimal' },
           responseMimeType: 'application/json',
           responseSchema: contractAnalysisResponseSchema,
           systemInstruction: contractAnalysisSystemInstruction,
@@ -800,6 +835,7 @@ function validateContractAnalysisResponseShape(payload) {
     typeof payload.summary !== 'string'
     || typeof payload.risk_level !== 'string'
     || !Array.isArray(payload.findings)
+    || !Array.isArray(payload.suggestions)
     || !Array.isArray(payload.recommendations)
     || typeof payload.report_markdown !== 'string'
   ) {
@@ -830,12 +866,33 @@ function validateContractAnalysisResponseShape(payload) {
     });
   }
 
+  const normalizedSuggestions = [];
+  for (const suggestion of payload.suggestions) {
+    if (!suggestion || typeof suggestion !== 'object' || Array.isArray(suggestion)) {
+      return {
+        ok: false,
+        code: 'invalid_model_schema',
+        message: 'El modelo devolvio una estructura invalida para el analisis contractual.',
+      };
+    }
+
+    normalizedSuggestions.push({
+      action: normalizeContractSuggestionAction(suggestion.action),
+      title: normalizeTextField(suggestion.title, 'Sugerencia contractual'),
+      clause: normalizeTextField(suggestion.clause, 'Sin referencia especifica'),
+      reason: normalizeTextField(suggestion.reason),
+      proposed_text: normalizeTextBlock(suggestion.proposed_text),
+      priority: normalizeContractSuggestionPriority(suggestion.priority),
+    });
+  }
+
   return {
     ok: true,
     data: {
       summary: normalizeTextField(payload.summary, 'Analisis contractual completado.'),
       risk_level: normalizeContractSeverity(payload.risk_level, 'medio'),
       findings: normalizedFindings,
+      suggestions: normalizedSuggestions,
       recommendations: payload.recommendations.map((item) => normalizeTextField(item)).filter(Boolean),
       report_markdown: normalizeTextField(payload.report_markdown, 'Sin dictamen disponible.'),
     },
@@ -858,6 +915,45 @@ function normalizeContractSeverity(value, fallback = 'medio') {
   }
 
   return fallback;
+}
+
+function normalizeContractSuggestionAction(value) {
+  const normalized = String(value || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\s-]+/g, '_');
+
+  if (normalized === 'agregar' || normalized === 'quitar' || normalized === 'rectificar') {
+    return normalized;
+  }
+
+  return 'rectificar';
+}
+
+function normalizeContractSuggestionPriority(value) {
+  const normalized = String(value || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\s-]+/g, '_');
+
+  if (normalized === 'alta' || normalized === 'media' || normalized === 'baja') {
+    return normalized;
+  }
+
+  return 'media';
+}
+
+function normalizeTextBlock(value, fallback = '') {
+  const normalized = String(value || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  return normalized !== '' ? normalized : fallback;
 }
 function normalizeAuditReferences(references) {
   if (!Array.isArray(references)) {
@@ -1007,9 +1103,6 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`AI service escuchando en http://localhost:${PORT}`);
 });
-
-
-
 
 
 
