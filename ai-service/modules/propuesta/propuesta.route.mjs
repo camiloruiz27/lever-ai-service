@@ -54,13 +54,13 @@ export function registerPropuestaRoute(app, deps) {
         model,
         razon_social: validation.proposalContext.cliente.razonSocial,
         token_usage: result.tokenUsage,
-        quality_flags: result.secondPassUsed ? ['investment_structure_repaired'] : null,
+        quality_flags: result.qualityFlags.length > 0 ? result.qualityFlags : null,
       });
 
       return res.json({
         text: result.text,
         token_usage: result.tokenUsage,
-        quality_flags: result.secondPassUsed ? ['investment_structure_repaired'] : null,
+        quality_flags: result.qualityFlags.length > 0 ? result.qualityFlags : null,
       });
     } catch (err) {
       const runtimeError = normalizeModelRuntimeError(err, 'proposal_runtime_error', 'Error generando propuesta');
