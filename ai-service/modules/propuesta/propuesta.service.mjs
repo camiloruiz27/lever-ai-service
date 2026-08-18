@@ -10,6 +10,18 @@ function hasInvestmentStructure(text) {
   return hasPhaseValue && hasPhasePayment && hasSummary && hasMoney;
 }
 
+function buildOrthographicReviewInput(text) {
+  return [
+    'Corrige exclusivamente ortografia, tildes, puntuacion, concordancia gramatical y pequenos errores de redaccion del siguiente texto.',
+    'Manten intactos el idioma espanol, la esencia juridico-comercial, la estructura, la numeracion, los encabezados, las fases, los valores, los nombres propios, las fechas y la forma de pago.',
+    'No agregues servicios, no elimines contenido, no cambies cifras, no cambies el sentido y no conviertas la respuesta a markdown, tabla o JSON.',
+    'Devuelve solamente el texto corregido.',
+    '',
+    'Texto a corregir:',
+    String(text || '').trim(),
+  ].join('\n');
+}
+
 export async function generateProposal({
   ai,
   model,
@@ -58,6 +70,7 @@ export async function generateProposal({
   let finalText = firstPass.text;
   let finalUsage = firstPass.usageMetadata;
   let secondPassUsed = false;
+  let orthographicReviewUsed = false;
 
   const requiresInvestment = Number.isFinite(proposalContext.comercial.valorTotalCOP) && proposalContext.comercial.valorTotalCOP > 0;
   if (requiresInvestment && !hasInvestmentStructure(finalText)) {
@@ -89,10 +102,31 @@ export async function generateProposal({
     finalUsage = secondPass.usageMetadata ?? finalUsage;
   }
 
+  if (finalText) {
+    const reviewed = await runGeneration(buildOrthographicReviewInput(finalText));
+    const reviewedKeepsInvestmentStructure = !requiresInvestment || hasInvestmentStructure(reviewed.text);
+    if (reviewed.text && reviewedKeepsInvestmentStructure) {
+      finalText = reviewed.text;
+      finalUsage = reviewed.usageMetadata ?? finalUsage;
+      orthographicReviewUsed = true;
+    } else if (typeof logWarn === 'function') {
+      logWarn('proposal_orthographic_review_discarded', requestId, {
+        endpoint: '/api/propuesta',
+        reason: reviewed.text ? 'missing_investment_sections_after_review' : 'empty_review_response',
+      });
+    }
+  }
+
+  const qualityFlags = [];
+  if (secondPassUsed) qualityFlags.push('investment_structure_repaired');
+  if (orthographicReviewUsed) qualityFlags.push('orthographic_review_applied');
+
   return {
     text: finalText,
     tokenUsage: mapTokenUsage(finalUsage),
     usageMetadataPresent: Boolean(finalUsage),
     secondPassUsed,
+    orthographicReviewUsed,
+    qualityFlags,
   };
 }
