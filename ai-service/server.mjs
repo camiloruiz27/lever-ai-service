@@ -2,6 +2,7 @@ import 'dotenv/config';
 import crypto from 'crypto';
 import express from 'express';
 import cors from 'cors';
+import rateLimit from 'express-rate-limit';
 import { GoogleGenAI, createPartFromBase64, createPartFromText } from '@google/genai';
 import { registerPropuestaRoute } from './modules/propuesta/propuesta.route.mjs';
 
@@ -9,6 +10,15 @@ const app = express();
 const corsOrigin = process.env.CORS_ORIGIN || '*';
 app.use(cors({ origin: corsOrigin }));
 app.use(express.json({ limit: '20mb' }));
+
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'too_many_requests', message: 'Demasiadas solicitudes. Intenta de nuevo en unos minutos.' },
+});
+app.use('/api/', apiLimiter);
 
 app.use((req, res, next) => {
   req.requestId = crypto.randomUUID();
@@ -26,7 +36,7 @@ if (!internalApiKey) {
   console.error('Falta INTERNAL_API_KEY. Define la variable de entorno o ai-service/.env');
   process.exit(1);
 }
-const ai = new GoogleGenAI({ apiKey });
+const ai = new GoogleGenAI({ apiKey, httpOptions: { timeout: 25000 } });
 const model = 'gemini-3.5-flash-lite';
 const MAX_MODEL_ERROR_LOG_CHARS = 1500;
 const MODEL_OVERLOAD_MAX_RETRIES = 2;
@@ -602,7 +612,7 @@ function normalizeModelRuntimeError(err, fallbackCode, fallbackMessage) {
   return {
     status: 500,
     code: fallbackCode,
-    clientMessage: err?.message || fallbackMessage,
+    clientMessage: fallbackMessage,
     logMessage: err?.message || fallbackMessage,
   };
 }

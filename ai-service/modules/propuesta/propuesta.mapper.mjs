@@ -1,5 +1,28 @@
+const MAX_TEXT_FIELD_LENGTH = 20000;
+
 function cleanText(value) {
   return String(value ?? '').replace(/\s+/g, ' ').trim();
+}
+
+const LONG_TEXT_FIELDS = [
+  ['objetivoCliente', (c) => c.objetivoCliente],
+  ['contextoCaso', (c) => c.contextoCaso],
+  ['partesInvolucradas', (c) => c.partesInvolucradas],
+  ['serviciosSugeridos', (c) => c.serviciosSugeridos],
+  ['costosExclusiones', (c) => c.costosExclusiones],
+  ['informacionAdicional', (c) => c.informacionAdicional],
+  ['cliente.razonSocial', (c) => c.cliente.razonSocial],
+  ['comercial.formaPago', (c) => c.comercial.formaPago],
+];
+
+function findFieldExceedingMaxLength(normalized) {
+  for (const [field, getValue] of LONG_TEXT_FIELDS) {
+    const value = getValue(normalized);
+    if (typeof value === 'string' && value.length > MAX_TEXT_FIELD_LENGTH) {
+      return field;
+    }
+  }
+  return null;
 }
 
 function normalizeCopValue(value) {
@@ -67,6 +90,15 @@ export function validateProposalRequest(body) {
       ok: false,
       code: 'missing_required_fields',
       message: 'Faltan campos obligatorios en proposal_context: objetivoCliente y cliente.razonSocial.',
+    };
+  }
+
+  const fieldTooLong = findFieldExceedingMaxLength(normalized);
+  if (fieldTooLong) {
+    return {
+      ok: false,
+      code: 'field_too_long',
+      message: `El campo ${fieldTooLong} supera el maximo permitido de ${MAX_TEXT_FIELD_LENGTH} caracteres.`,
     };
   }
 
