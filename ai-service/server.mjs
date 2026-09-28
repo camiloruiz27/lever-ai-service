@@ -1,4 +1,4 @@
-import 'dotenv/config';
+﻿import 'dotenv/config';
 import crypto from 'crypto';
 import express from 'express';
 import cors from 'cors';
@@ -37,7 +37,7 @@ if (!internalApiKey) {
   process.exit(1);
 }
 const ai = new GoogleGenAI({ apiKey, httpOptions: { timeout: 25000 } });
-const model = 'gemini-3.5-flash-lite';
+const model = 'gemini-3.8-flash';
 const MAX_MODEL_ERROR_LOG_CHARS = 1500;
 const MODEL_OVERLOAD_MAX_RETRIES = 2;
 const MODEL_OVERLOAD_BASE_DELAY_MS = 900;
